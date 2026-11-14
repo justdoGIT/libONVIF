@@ -17,13 +17,16 @@
 #ifdef WITH_OPENSSL
 #include "httpda.h"
 #endif // WITH_OPENSSL
+#include "info.h"
 #include "namespaces.nsmap"
 #include "wsaapi.h"
 #include <QDebug>
+#include <QLatin1String>
+#include <QMutexLocker>
 #include <QPointer>
 #include <QString>
-#include <QMutexLocker>
-#if(QT_VERSION >= QT_VERSION_CHECK(5, 14, 0))
+#include <QSysInfo>
+#if (QT_VERSION >= QT_VERSION_CHECK(5, 14, 0))
 #define HAS_QT_RECURSIVEMUTEX
 #include <QRecursiveMutex>
 #else
@@ -34,8 +37,16 @@
 struct arbData {
 
 	bool enableDebug = false;
+	QString userAgent = QString("%1/%2.%3.%4 (%5; %6)")
+	                     .arg(INFO_PROJECTNAME)
+	                     .arg(INFO_VERSION_MAJOR)
+	                     .arg(INFO_VERSION_MINOR)
+	                     .arg(INFO_VERSION_PATCH)
+	                     .arg(QSysInfo::prettyProductName())
+	                     .arg(QSysInfo::currentCpuArchitecture());
 	int (*fsend)(struct soap *, const char *, size_t) = nullptr;
 	size_t (*frecv)(struct soap *, char *, size_t) = nullptr;
+	int (*fposthdr)(struct soap *soap, const char *key, const char *val) = nullptr;
 	QPointer<QObject> pObject = nullptr;
 };
 
@@ -49,6 +60,16 @@ int fsend(struct soap *soap, const char *s, size_t n) {
 	return ret;
 }
 
+int fposthdr(struct soap *soap, const char *key, const char *val) {
+
+	auto latinKey = QLatin1String(key);
+	const auto latinUserAgent = QLatin1String("User-Agent");
+	if(latinKey.size() == latinUserAgent.size() && QLatin1String(key).startsWith(QLatin1String("User-Agent"), Qt::CaseInsensitive)) {
+		return ((arbData *)soap->user)->fposthdr(soap, key, qPrintable(((arbData *)soap->user)->userAgent));
+	}
+	return ((arbData *)soap->user)->fposthdr(soap, key, val);
+}
+
 size_t frecv(struct soap *soap, char *s, size_t n) {
 
 	auto length = ((arbData *)soap->user)->frecv(soap, s, n);
@@ -58,6 +79,17 @@ size_t frecv(struct soap *soap, char *s, size_t n) {
 	}
 	return length;
 }
+
+// Somehow "SSL_CTX_new(TLS_method())" will return null (internally signaling SSL_R_LIBRARY_HAS_NO_CIPHERS) if Qt initializes openssl
+// (SSL_library_init()) first. Maybe Qt disables all ciphers by default? This initializer will make sure that we initialize openssl first.
+// This also ensures that openssl is initialized by the main thread without creating a race condition with other threads.
+#ifdef WITH_OPENSSL
+class SoapCtxSslInitializer {
+ public:
+	SoapCtxSslInitializer() { soap_ssl_init(); }
+};
+static SoapCtxSslInitializer soapSslInitilizer;
+#endif
 
 struct CtxPrivate {
 	explicit CtxPrivate(SoapCtx *pQ) :
@@ -106,7 +138,7 @@ struct CtxPrivate {
 SoapCtx::SoapCtx() : mpD(new CtxPrivate(this)) {
 
 	mpD->mpSoap = soap_new();
-	soap_init2(mpD->mpSoap, SOAP_NEW_IO_DEFAULT, SOAP_NEW_IO_DEFAULT);
+	soap_init2(mpD->mpSoap, SOAP_NEW_I_DEFAULT, SOAP_NEW_O_DEFAULT);
 	InitCtx();
 }
 
@@ -263,14 +295,18 @@ void SoapCtx::InitCtx() {
 
 	int (*pFsend)(struct soap *, const char *, size_t);
 	pFsend = &fsend;
-	size_t (*pFrecv)(struct soap * soap, char *s, size_t n);
+	size_t (*pFrecv)(struct soap *soap, char *s, size_t n);
 	pFrecv = &frecv;
+	int (*pFposthdr)(struct soap *soap, const char *s, const char *v);
+	pFposthdr = &fposthdr;
 	auto ud = new arbData();
 	ud->frecv = mpD->mpSoap->frecv;
 	ud->fsend = mpD->mpSoap->fsend;
+	ud->fposthdr = mpD->mpSoap->fposthdr;
 	mpD->mpSoap->user = ud;
 	mpD->mpSoap->frecv = pFrecv;
 	mpD->mpSoap->fsend = pFsend;
+	mpD->mpSoap->fposthdr = pFposthdr;
 	SetSoapAuthHandler(std::unique_ptr<SoapAuthHandler>(new DefaultAuthHandler()));
 }
 
@@ -380,6 +416,12 @@ void SoapCtx::DisablePrintRawSoap() {
 
 	QMutexLocker locker(&mpD->mMutex);
 	((arbData *)mpD->mpSoap->user)->enableDebug = false;
+}
+
+void SoapCtx::SetUserAgent(const QString &rUserAgent) {
+
+	QMutexLocker locker(&mpD->mMutex);
+	((arbData *)mpD->mpSoap->user)->userAgent = rUserAgent;
 }
 
 void SoapCtx::SetSocketFlags(int soFlags) {
